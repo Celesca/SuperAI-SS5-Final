@@ -1,0 +1,204 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import WeightedRandomSampler
+import numpy as np
+from scipy import signal
+import pywt
+from typing import List, Union, Optional, Tuple
+from dataclasses import dataclass
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class PreprocessingConfig:
+    """Configuration parameters for signal preprocessing."""
+    snr_threshold: float = 3.0
+    wavelet_name: str = 'db4'
+    decomposition_level: int = 2
+    normalization_method: str = 'standard'  # 'standard', 'minmax', or 'robust'
+    use_parallel: bool = True
+    n_workers: int = 4
+    batch_size: int = 32
+
+class SignalPreprocessor:
+    """Enhanced signal preprocessor with advanced denoising and normalization capabilities."""
+    
+    def __init__(self, config: Optional[PreprocessingConfig] = None):
+        """
+        Initialize the signal preprocessor.
+        
+        Args:
+            config: PreprocessingConfig object containing preprocessing parameters
+        """
+        self.config = config or PreprocessingConfig()
+        self._validate_config()
+        self.processed_stats = {}  # Store statistics about processed signals
+        
+    def _validate_config(self) -> None:
+        """Validate configuration parameters."""
+        if self.config.snr_threshold <= 0:
+            raise ValueError("SNR threshold must be positive")
+        if self.config.decomposition_level < 1:
+            raise ValueError("Decomposition level must be at least 1")
+        if not pywt.wavelist(kind='discrete').__contains__(self.config.wavelet_name):
+            raise ValueError(f"Wavelet {self.config.wavelet_name} not found in available wavelets")
+
+    def estimate_noise(self, data: np.ndarray) -> float:
+        """
+        Estimate noise level using robust statistics.
+        
+        Args:
+            data: Input signal data
+            
+        Returns:
+            Estimated noise level
+        """
+        try:
+            # Use both MAD and IQR for more robust noise estimation
+            mad = np.median(np.abs(data - np.median(data)))
+            noise_mad = 1.4826 * mad
+            
+            q75, q25 = np.percentile(data, [75, 25])
+            noise_iqr = 0.7413 * (q75 - q25)
+            
+            # Use the minimum of both estimates
+            return min(noise_mad, noise_iqr)
+        except Exception as e:
+            logger.error(f"Error in noise estimation: {str(e)}")
+            raise
+
+    def calculate_snr(self, data: np.ndarray) -> float:
+        """
+        Calculate Signal-to-Noise Ratio.
+        
+        Args:
+            data: Input signal data
+            
+        Returns:
+            Calculated SNR value
+        """
+        signal_power = np.mean(np.square(data))
+        noise_level = self.estimate_noise(data)
+        return 10 * np.log10(signal_power / (noise_level ** 2)) if noise_level > 0 else float('inf')
+
+    def apply_wavelet_denoising(self, data: np.ndarray) -> np.ndarray:
+        """
+        Apply wavelet denoising with adaptive thresholding.
+        
+        Args:
+            data: Input signal data
+            
+        Returns:
+            Denoised signal
+        """
+        try:
+            # Perform multilevel wavelet decomposition
+            coeffs = pywt.wavedec(data, self.config.wavelet_name, 
+                                level=self.config.decomposition_level)
+            
+            # Adaptive threshold based on level-dependent noise estimate
+            noise_sigma = self.estimate_noise(data)
+            thresholds = [noise_sigma * np.sqrt(2 * np.log(len(coeff))) 
+                         for coeff in coeffs[1:]]
+            
+            # Apply level-dependent soft thresholding
+            coeffs_thresholded = [coeffs[0]]  # Keep approximation coefficients
+            for coeff, threshold in zip(coeffs[1:], thresholds):
+                coeffs_thresholded.append(pywt.threshold(coeff, threshold, mode='soft'))
+            
+            # Reconstruct signal
+            denoised = pywt.waverec(coeffs_thresholded, self.config.wavelet_name)
+            
+            # Ensure output length matches input
+            return denoised[:len(data)]
+        except Exception as e:
+            logger.error(f"Error in wavelet denoising: {str(e)}")
+            raise
+
+    def normalize_signal(self, data: np.ndarray) -> np.ndarray:
+        """
+        Normalize signal using specified method.
+        
+        Args:
+            data: Input signal data
+            
+        Returns:
+            Normalized signal
+        """
+        if self.config.normalization_method == 'standard':
+            return (data - np.mean(data)) / (np.std(data) + 1e-10)
+        elif self.config.normalization_method == 'minmax':
+            min_val, max_val = np.min(data), np.max(data)
+            return (data - min_val) / (max_val - min_val + 1e-10)
+        elif self.config.normalization_method == 'robust':
+            median = np.median(data)
+            mad = np.median(np.abs(data - median))
+            return (data - median) / (mad + 1e-10)
+        else:
+            raise ValueError(f"Unknown normalization method: {self.config.normalization_method}")
+
+    def _process_single_signal(self, signal_data: np.ndarray) -> np.ndarray:
+        """
+        Process a single signal with full pipeline.
+        
+        Args:
+            signal_data: Input signal data
+            
+        Returns:
+            Processed signal
+        """
+        # Check signal quality
+        snr = self.calculate_snr(signal_data)
+        if snr < self.config.snr_threshold:
+            logger.warning(f"Low SNR detected: {snr:.2f} dB")
+            
+        # Apply denoising
+        denoised = self.apply_wavelet_denoising(signal_data)
+        
+        # Normalize
+        processed = self.normalize_signal(denoised)
+        
+        # Store statistics
+        self.processed_stats[id(signal_data)] = {
+            'snr': snr,
+            'noise_level': self.estimate_noise(signal_data),
+            'original_shape': signal_data.shape,
+            'processed_shape': processed.shape
+        }
+        
+        return processed
+
+    def preprocess_batch(self, batch: np.ndarray) -> np.ndarray:
+        """
+        Preprocess a batch of signals with optional parallel processing.
+        
+        Args:
+            batch: Batch of input signals
+            
+        Returns:
+            Processed batch of signals
+        """
+        if not isinstance(batch, np.ndarray):
+            batch = np.array(batch)
+            
+        if self.config.use_parallel and len(batch) > 1:
+            with ThreadPoolExecutor(max_workers=self.config.n_workers) as executor:
+                processed = list(executor.map(self._process_single_signal, batch))
+        else:
+            processed = [self._process_single_signal(signal) for signal in batch]
+            
+        return np.array(processed)
+
+    def get_processing_stats(self) -> dict:
+        """Return statistics about processed signals."""
+        return self.processed_stats
+
+    def reset_stats(self) -> None:
+        """Reset processing statistics."""
+        self.processed_stats = {}
